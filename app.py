@@ -586,8 +586,8 @@ def validate_meta_connection(access_token: str, ad_account_id: str, app_id: str 
             'access_token': access_token,
             'fields': 'name,id,currency,account_status,timezone_name,spend_cap,amount_spent'
         }
-        if app_secret:
-            params['appsecret_proof'] = _meta_appsecret_proof(access_token, app_secret)
+        # appsecret_proof is intentionally omitted during validation.
+        # Only include it on data calls if the Meta app has "Require App Secret" enforced.
 
         resp = requests.get(f"{META_BASE_URL}/{ad_account_id}", params=params, timeout=15)
         result = resp.json()
@@ -695,8 +695,6 @@ def fetch_meta_campaign_performance(access_token: str, ad_account_id: str,
         }),
         'limit': 500,
     }
-    if app_secret:
-        params['appsecret_proof'] = _meta_appsecret_proof(access_token, app_secret)
 
     url  = f"{META_BASE_URL}/{ad_account_id}/insights"
     rows = []
@@ -743,8 +741,6 @@ def fetch_meta_daily_performance(access_token: str, ad_account_id: str,
         }),
         'limit': 500,
     }
-    if app_secret:
-        params['appsecret_proof'] = _meta_appsecret_proof(access_token, app_secret)
 
     url  = f"{META_BASE_URL}/{ad_account_id}/insights"
     rows = []
