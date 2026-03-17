@@ -641,7 +641,7 @@ def _meta_extract_conversions(row_data: dict):
 
     return conversions, conv_value
 
-def _meta_paginate(initial_url: str, initial_params: dict, timeout: int = 30):
+def _meta_paginate(initial_url: str, initial_params: dict, timeout: int = 60):
     """
     Generator that yields rows from a Meta API paginated response.
     Handles cursor-based pagination automatically.
@@ -1329,8 +1329,6 @@ def main():
                         }),
                         use_container_width=True
                     )
-            return  # Don't show per-platform section for "All Platforms"
-
         # ── Google Aggregate ──
         if selected_platform_agg == "Google Ads":
             if not google_avail:
@@ -1442,16 +1440,11 @@ def main():
             meta_camp_filter = c1.text_input("Filter by Campaign Name", placeholder="Type campaign name…", key="agg_meta_camp_filter")
             meta_exact       = c2.checkbox("Exact", key="agg_meta_exact")
 
-            if st.button("📥 Load Meta Data", key="load_agg_meta", type="primary"):
+            # ── Button 1: KPI metrics (campaign-level, fast) ──
+            if st.button("📥 Load KPI Metrics", key="load_agg_meta_kpi", type="primary"):
                 if st.session_state.meta_connected:
-                    with st.spinner("Fetching from Meta Ads API…"):
-                        m_camp  = fetch_meta_campaign_performance(
-                            st.session_state.meta_access_token,
-                            st.session_state.meta_ad_account_id,
-                            start_date_m, end_date_m,
-                            st.session_state.meta_app_secret
-                        )
-                        m_daily = fetch_meta_daily_performance(
+                    with st.spinner("Fetching Meta campaign KPIs… (this is fast)"):
+                        m_camp = fetch_meta_campaign_performance(
                             st.session_state.meta_access_token,
                             st.session_state.meta_ad_account_id,
                             start_date_m, end_date_m,
@@ -1459,7 +1452,6 @@ def main():
                         )
                         if not m_camp.empty:
                             st.session_state.meta_campaign_data = m_camp
-                            st.session_state.meta_daily_data    = m_daily
                             st.success(f"✅ Loaded {len(m_camp)} Meta campaigns!")
                         else:
                             st.warning("No Meta campaign data found for this date range.")
@@ -1477,44 +1469,65 @@ def main():
                     st.warning("No matching campaigns.")
                     st.stop()
 
-                total_spend = m_df['cost'].sum()
-                total_rev   = m_df['conversions_value'].sum()
-                total_roas  = total_rev/total_spend if total_spend>0 else 0
-                total_clicks= m_df['clicks'].sum()
-                total_impr  = m_df['impressions'].sum()
-                total_conv  = m_df['conversions'].sum()
-                total_cpc   = total_spend/total_clicks if total_clicks>0 else 0
-                total_ctr   = total_clicks/total_impr*100 if total_impr>0 else 0
+                total_spend  = m_df['cost'].sum()
+                total_rev    = m_df['conversions_value'].sum()
+                total_roas   = total_rev/total_spend if total_spend>0 else 0
+                total_clicks = m_df['clicks'].sum()
+                total_impr   = m_df['impressions'].sum()
+                total_conv   = m_df['conversions'].sum()
+                total_cpc    = total_spend/total_clicks if total_clicks>0 else 0
+                total_ctr    = total_clicks/total_impr*100 if total_impr>0 else 0
 
                 st.subheader("Key Performance Metrics — Meta Ads")
                 c1,c2,c3 = st.columns(3)
-                c1.markdown(display_metric_card("Spend",       total_spend,  None, 'currency'), unsafe_allow_html=True)
-                c2.markdown(display_metric_card("CPC",         total_cpc,    None, 'currency'), unsafe_allow_html=True)
-                c3.markdown(display_metric_card("ROAS",        total_roas,   None, 'number'),   unsafe_allow_html=True)
+                c1.markdown(display_metric_card("Spend",       total_spend,  None, 'currency'),    unsafe_allow_html=True)
+                c2.markdown(display_metric_card("CPC",         total_cpc,    None, 'currency'),    unsafe_allow_html=True)
+                c3.markdown(display_metric_card("ROAS",        total_roas,   None, 'number'),      unsafe_allow_html=True)
                 c1,c2,c3 = st.columns(3)
-                c1.markdown(display_metric_card("CTR",         total_ctr,    None, 'percentage'), unsafe_allow_html=True)
-                c2.markdown(display_metric_card("Clicks",      total_clicks, None, 'number'),   unsafe_allow_html=True)
-                c3.markdown(display_metric_card("Impressions", total_impr,   None, 'number'),   unsafe_allow_html=True)
+                c1.markdown(display_metric_card("CTR",         total_ctr,    None, 'percentage'),  unsafe_allow_html=True)
+                c2.markdown(display_metric_card("Clicks",      total_clicks, None, 'number'),      unsafe_allow_html=True)
+                c3.markdown(display_metric_card("Impressions", total_impr,   None, 'number'),      unsafe_allow_html=True)
                 c1,c2,c3 = st.columns(3)
-                c1.markdown(display_metric_card("Revenue",     total_rev,    None, 'currency'), unsafe_allow_html=True)
-                c2.markdown(display_metric_card("Conversions", total_conv,   None, 'number'),   unsafe_allow_html=True)
-
+                c1.markdown(display_metric_card("Revenue",     total_rev,    None, 'currency'),    unsafe_allow_html=True)
+                c2.markdown(display_metric_card("Conversions", total_conv,   None, 'number'),      unsafe_allow_html=True)
                 if 'reach' in m_df.columns:
                     total_reach = m_df['reach'].sum()
-                    c3.markdown(display_metric_card("Total Reach", total_reach, None, 'number'), unsafe_allow_html=True)
+                    c3.markdown(display_metric_card("Total Reach", total_reach, None, 'number'),   unsafe_allow_html=True)
 
-                # Time-series
+                # ── Button 2: Daily time-series (separate, slower) ──
+                st.markdown("---")
+                st.subheader("📈 Meta Performance Over Time")
+                st.caption("Daily data is fetched separately as it can be slower for large accounts.")
+
+                if st.button("📥 Load Daily Chart Data", key="load_agg_meta_daily"):
+                    if st.session_state.meta_connected:
+                        with st.spinner("Fetching daily Meta data… (may take up to 60s for large accounts)"):
+                            m_daily = fetch_meta_daily_performance(
+                                st.session_state.meta_access_token,
+                                st.session_state.meta_ad_account_id,
+                                start_date_m, end_date_m,
+                                st.session_state.meta_app_secret
+                            )
+                            if not m_daily.empty:
+                                st.session_state.meta_daily_data = m_daily
+                                st.success(f"✅ Daily data loaded! ({len(m_daily)} rows)")
+                            else:
+                                st.warning("No daily data returned — try a shorter date range.")
+                    else:
+                        st.warning("Please connect Meta Ads API first (CSV uploads don't have daily breakdown).")
+
                 if st.session_state.meta_daily_data is not None and not st.session_state.meta_daily_data.empty:
-                    st.markdown("---")
-                    st.subheader("📈 Meta Performance Over Time")
                     daily_m = st.session_state.meta_daily_data.copy()
                     if meta_camp_filter:
                         daily_m = daily_m[daily_m['campaign_name']==meta_camp_filter] if meta_exact else daily_m[daily_m['campaign_name'].str.contains(meta_camp_filter, case=False, na=False)]
                     metric_opts_m = {'cost':'Spend','clicks':'Clicks','impressions':'Impressions',
                                      'conversions':'Conversions','conversions_value':'Revenue',
                                      'ctr':'CTR (%)','cpc':'CPC','conv_value_cost':'ROAS','aov':'AOV'}
-                    sel_m = st.selectbox("Metric:", list(metric_opts_m.keys()), format_func=lambda x: metric_opts_m[x], key="agg_meta_metric")
+                    sel_m = st.selectbox("Metric:", list(metric_opts_m.keys()),
+                                         format_func=lambda x: metric_opts_m[x], key="agg_meta_metric")
                     st.plotly_chart(create_time_series_chart(daily_m, sel_m, metric_opts_m[sel_m]), use_container_width=True)
+                else:
+                    st.info("👆 Click **Load Daily Chart Data** above to render the time-series chart.")
 
     # ══════════════════════════════════════════
     # TAB 2 — CAMPAIGN BREAKDOWN
@@ -1765,10 +1778,29 @@ def main():
 
                 render_campaign_table(df_m, platform='Meta')
 
-                # Time-series for Meta
+                # Time-series for Meta — separate load button
+                st.markdown("---")
+                st.subheader("📈 Meta Campaign Performance Over Time")
+                st.caption("Daily data is fetched separately to avoid timeouts on large accounts.")
+
+                if st.button("📥 Load Daily Chart Data", key="load_meta_camp_daily"):
+                    if st.session_state.meta_connected:
+                        with st.spinner("Fetching daily Meta data… (may take up to 60s for large accounts)"):
+                            m_daily = fetch_meta_daily_performance(
+                                st.session_state.meta_access_token,
+                                st.session_state.meta_ad_account_id,
+                                start_date_meta, end_date_meta,
+                                st.session_state.meta_app_secret
+                            )
+                            if not m_daily.empty:
+                                st.session_state.meta_daily_data = m_daily
+                                st.success(f"✅ Daily data loaded! ({len(m_daily)} rows)")
+                            else:
+                                st.warning("No daily data returned — try a shorter date range.")
+                    else:
+                        st.warning("Daily chart requires Meta API connection (not available from CSV).")
+
                 if st.session_state.meta_daily_data is not None and not st.session_state.meta_daily_data.empty:
-                    st.markdown("---")
-                    st.subheader("📈 Meta Campaign Performance Over Time")
                     daily_m = st.session_state.meta_daily_data.copy()
                     if camp_filter_m:
                         daily_m = daily_m[daily_m['campaign_name']==camp_filter_m] if exact_m else daily_m[daily_m['campaign_name'].str.contains(camp_filter_m, case=False, na=False)]
@@ -1785,6 +1817,8 @@ def main():
                             st.plotly_chart(fig_m, use_container_width=True)
                         else:
                             st.info("Select at least one metric.")
+                else:
+                    st.info("👆 Click **Load Daily Chart Data** above to render the time-series chart.")
 
                 # Download
                 csv_m = df_m.to_csv(index=False)
