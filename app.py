@@ -59,9 +59,20 @@ defaults = {
     'meta_account_info': None,
     'meta_campaign_data': None, 'meta_daily_data': None,
     'meta_data': None,
-    # TikTok / Shopify
+    # Microsoft (Bing) Ads
+    'bing_connected': False, 'bing_csv_uploaded': False,
+    'bing_developer_token': None, 'bing_client_id': None, 'bing_client_secret': None,
+    'bing_refresh_token': None, 'bing_customer_id': None, 'bing_account_id': None,
+    'bing_account_info': None, 'bing_auth_data': None,
+    'bing_campaign_data': None, 'bing_daily_data': None, 'bing_data': None,
+    # TikTok
     'tiktok_connected': False, 'tiktok_csv_uploaded': False, 'tiktok_data': None,
+    # Shopify
     'shopify_connected': False, 'shopify_csv_uploaded': False, 'shopify_data': None,
+    'shopify_store_url_val': None, 'shopify_access_token_val': None,
+    'shopify_shop_info': None,
+    'shopify_orders_df': None, 'shopify_metrics': None,
+    'shopify_daily_df': None, 'shopify_top_products': None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -770,6 +781,417 @@ def fetch_meta_daily_performance(access_token: str, ad_account_id: str,
         df['aov']             = df.apply(lambda x: x['conversions_value']/x['conversions'] if x['conversions']>0 else 0, axis=1)
     return df
 
+
+
+# ─────────────────────────────────────────────
+# MICROSOFT (BING) ADS HELPERS
+# ─────────────────────────────────────────────
+
+def _bing_sdk_available():
+    try:
+        import bingads  # noqa
+        return True
+    except ImportError:
+        return False
+
+def _bing_create_auth_data(developer_token, client_id, client_secret,
+                            refresh_token, customer_id, account_id):
+    """Build a bingads AuthorizationData object from stored credentials."""
+    from bingads.authorization import AuthorizationData, OAuthWebAuthCodeGrant
+    auth = OAuthWebAuthCodeGrant(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirection_uri='https://login.microsoftonline.com/common/oauth2/nativeclient'
+    )
+    auth.request_oauth_tokens_by_refresh_token(refresh_token)
+    return AuthorizationData(
+        account_id=int(account_id),
+        customer_id=int(customer_id),
+        developer_token=developer_token,
+        authentication=auth
+    )
+
+def validate_bing_connection(developer_token, client_id, client_secret,
+                              refresh_token, customer_id, account_id):
+    """
+    Validate Microsoft Ads credentials.
+    Returns (success, error_msg, account_info_dict, auth_data)
+    """
+    if not _bing_sdk_available():
+        return False, "bingads package not installed. Add 'bingads' to requirements.txt and restart the app.", None, None
+    try:
+        from bingads.service_client import ServiceClient
+        auth_data = _bing_create_auth_data(
+            developer_token, client_id, client_secret,
+            refresh_token, customer_id, account_id
+        )
+        svc  = ServiceClient('CustomerManagementService', version=13,
+                              authorization_data=auth_data, environment='production')
+        resp = svc.GetAccount(AccountId=int(account_id))
+        info = {
+            'name':     getattr(resp, 'Name', 'Unknown'),
+            'id':       str(account_id),
+            'currency': str(getattr(resp, 'CurrencyCode', '—')),
+            'customer_id': str(customer_id),
+        }
+        return True, None, info, auth_data
+    except Exception as e:
+        return False, str(e), None, None
+
+def _bing_submit_and_download_report(auth_data, account_id,
+                                      start_date, end_date,
+                                      aggregation='Summary',
+                                      extra_cols=None):
+    """
+    Core helper: submits a CampaignPerformanceReportRequest, polls until ready,
+    downloads the ZIP and returns a parsed DataFrame.
+    aggregation: 'Summary' or 'Daily'
+    """
+    import time, zipfile, io as _io, urllib.request, tempfile
+
+    from bingads.service_client import ServiceClient
+    svc = ServiceClient('ReportingService', version=13,
+                        authorization_data=auth_data, environment='production')
+
+    # ── Build request ──
+    req = svc.factory.create('CampaignPerformanceReportRequest')
+    req.Format              = 'Csv'
+    req.ReportName          = f'Campaign_{aggregation}'
+    req.ReturnOnlyCompleteData = False
+    req.Aggregation         = aggregation
+    req.ExcludeReportHeader = True
+    req.ExcludeReportFooter = True
+
+    base_cols = ['CampaignName', 'CampaignId', 'CampaignStatus',
+                 'Impressions', 'Clicks', 'Spend', 'Conversions', 'Revenue',
+                 'Ctr', 'AverageCpc']
+    if aggregation == 'Daily':
+        base_cols = ['TimePeriod'] + base_cols
+    if extra_cols:
+        base_cols += extra_cols
+
+    cols = svc.factory.create('ArrayOfCampaignPerformanceReportColumn')
+    cols.CampaignPerformanceReportColumn = base_cols
+    req.Columns = cols
+
+    # ── Scope ──
+    scope = svc.factory.create('AccountThroughCampaignReportScope')
+    aids  = svc.factory.create('ns5:ArrayOflong')
+    aids.long = [int(account_id)]
+    scope.AccountIds = aids
+    req.Scope = scope
+
+    # ── Time ──
+    rtime = svc.factory.create('ReportTime')
+    def _make_date(d):
+        bd = svc.factory.create('Date')
+        bd.Day = d.day; bd.Month = d.month; bd.Year = d.year
+        return bd
+    rtime.CustomDateRangeStart = _make_date(start_date)
+    rtime.CustomDateRangeEnd   = _make_date(end_date)
+    req.Time = rtime
+
+    # ── Submit ──
+    submit_resp   = svc.SubmitGenerateReport(ReportRequest=req)
+    report_req_id = submit_resp.ReportRequestId
+
+    # ── Poll ──
+    for _ in range(60):          # max 5 minutes
+        time.sleep(5)
+        poll_resp = svc.PollGenerateReport(ReportRequestId=report_req_id)
+        status    = poll_resp.ReportRequestStatus.Status
+        if status == 'Success':
+            download_url = poll_resp.ReportRequestStatus.ReportDownloadUrl
+            break
+        if status in ('Error', 'Failed'):
+            raise Exception(f"Microsoft Ads report failed: {status}")
+    else:
+        raise Exception("Microsoft Ads report timed out after 5 minutes.")
+
+    # ── Download + parse ──
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = os.path.join(tmpdir, 'report.zip')
+        urllib.request.urlretrieve(download_url, zip_path)
+        with zipfile.ZipFile(zip_path) as z:
+            with z.open(z.namelist()[0]) as f:
+                raw = f.read().decode('utf-8-sig')
+    df = pd.read_csv(_io.StringIO(raw))
+    return df
+
+def _bing_normalise_df(df, is_daily=False):
+    """Normalise column names and compute derived metrics."""
+    if df.empty:
+        return df
+    df.columns = [c.strip().lower().replace(' ', '_') for c in df.columns]
+    rename = {
+        'campaign':          'campaign_name',
+        'spend':             'cost',
+        'revenue':           'conversions_value',
+        'average_cpc':       'cpc_raw',
+        'ctr':               'ctr_raw',
+        'time_period':       'date',
+        'gregorian_date':    'date',
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    if is_daily and 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+    num_cols = ['cost', 'impressions', 'clicks', 'conversions', 'conversions_value']
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = (pd.to_numeric(
+                df[c].astype(str).str.replace(',', '').str.replace('$', '').str.strip(),
+                errors='coerce'
+            ).fillna(0))
+
+    df['cpc']             = df.apply(lambda x: x['cost']/x['clicks'] if x.get('clicks',0)>0 else 0, axis=1)
+    df['ctr']             = df.apply(lambda x: x['clicks']/x['impressions']*100 if x.get('impressions',0)>0 else 0, axis=1)
+    df['cost_per_conv']   = df.apply(lambda x: x['cost']/x['conversions'] if x.get('conversions',0)>0 else 0, axis=1)
+    df['conv_value_cost'] = df.apply(lambda x: x['conversions_value']/x['cost'] if x.get('cost',0)>0 else 0, axis=1)
+    df['aov']             = df.apply(lambda x: x['conversions_value']/x['conversions'] if x.get('conversions',0)>0 else 0, axis=1)
+    df['platform']        = 'Microsoft Ads'
+    return df
+
+def fetch_bing_campaign_performance(auth_data, account_id, start_date, end_date):
+    """Fetch Microsoft Ads campaign-level summary performance."""
+    if not _bing_sdk_available():
+        st.error("bingads package not installed.")
+        return pd.DataFrame()
+    try:
+        df = _bing_submit_and_download_report(
+            auth_data, account_id, start_date, end_date, aggregation='Summary'
+        )
+        return _bing_normalise_df(df, is_daily=False)
+    except Exception as e:
+        st.error(f"Microsoft Ads campaign fetch error: {e}")
+        return pd.DataFrame()
+
+def fetch_bing_daily_performance(auth_data, account_id, start_date, end_date):
+    """Fetch Microsoft Ads daily performance (for time-series charts)."""
+    if not _bing_sdk_available():
+        return pd.DataFrame()
+    try:
+        df = _bing_submit_and_download_report(
+            auth_data, account_id, start_date, end_date, aggregation='Daily'
+        )
+        return _bing_normalise_df(df, is_daily=True)
+    except Exception as e:
+        st.error(f"Microsoft Ads daily fetch error: {e}")
+        return pd.DataFrame()
+
+# ─────────────────────────────────────────────
+# SHOPIFY HELPERS
+# ─────────────────────────────────────────────
+
+SHOPIFY_API_VERSION = "2024-01"
+
+def _shopify_base_url(store_url: str) -> str:
+    """Normalise store URL to https://xxx.myshopify.com"""
+    store_url = store_url.strip().rstrip('/')
+    if not store_url.startswith('http'):
+        store_url = f"https://{store_url}"
+    return store_url
+
+def validate_shopify_connection(store_url: str, access_token: str):
+    """
+    Validate Shopify credentials via the shop endpoint.
+    Returns (success, error_msg, shop_info_dict)
+    """
+    try:
+        base = _shopify_base_url(store_url)
+        url  = f"{base}/admin/api/{SHOPIFY_API_VERSION}/shop.json"
+        resp = requests.get(url, headers={"X-Shopify-Access-Token": access_token}, timeout=10)
+        if resp.status_code == 401:
+            return False, "Invalid access token or insufficient permissions. Ensure the token has read_orders and read_customers scopes.", None
+        if resp.status_code == 404:
+            return False, "Store URL not found. Use the format: mystore.myshopify.com", None
+        if resp.status_code != 200:
+            return False, f"HTTP {resp.status_code}: {resp.text[:200]}", None
+        shop = resp.json().get('shop', {})
+        return True, None, {
+            'name':     shop.get('name', '—'),
+            'domain':   shop.get('domain', '—'),
+            'currency': shop.get('currency', '—'),
+            'timezone': shop.get('timezone', '—'),
+            'plan':     shop.get('plan_display_name', '—'),
+        }
+    except requests.exceptions.ConnectionError:
+        return False, "Cannot reach store URL. Double-check the URL.", None
+    except requests.exceptions.Timeout:
+        return False, "Connection timed out.", None
+    except Exception as e:
+        return False, str(e), None
+
+def _shopify_paginate_orders(store_url: str, access_token: str,
+                              created_at_min: str, created_at_max: str) -> list:
+    """
+    Fetch ALL orders between two ISO datetimes, handling Link-header pagination.
+    Returns list of raw order dicts.
+    """
+    base    = _shopify_base_url(store_url)
+    url     = f"{base}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
+    headers = {"X-Shopify-Access-Token": access_token}
+    params  = {
+        'status':           'any',
+        'financial_status': 'paid',
+        'created_at_min':   created_at_min,
+        'created_at_max':   created_at_max,
+        'limit':            250,
+        'fields':           'id,order_number,created_at,total_price,customer,line_items,financial_status',
+    }
+    all_orders = []
+    page = 0
+    while url:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        if resp.status_code == 429:          # rate limit
+            import time; time.sleep(2)
+            continue
+        if resp.status_code != 200:
+            raise Exception(f"Shopify API {resp.status_code}: {resp.text[:300]}")
+        orders = resp.json().get('orders', [])
+        all_orders.extend(orders)
+        page += 1
+        # Follow cursor-based next page
+        link  = resp.headers.get('Link', '')
+        next_url = None
+        if 'rel="next"' in link:
+            for part in link.split(','):
+                if 'rel="next"' in part:
+                    next_url = part.strip().split(';')[0].strip().strip('<>').strip()
+                    break
+        url    = next_url
+        params = {}          # params are encoded in the next URL
+    return all_orders
+
+def fetch_shopify_orders(store_url: str, access_token: str,
+                          start_date, end_date,
+                          lookback_days: int = 365) -> list:
+    """
+    Fetch orders for new/returning classification.
+    Pulls from (start_date - lookback_days) to end_date so we can identify
+    which customers had prior orders before the selected period.
+    """
+    lookback_start = (pd.to_datetime(start_date) - timedelta(days=lookback_days)).strftime('%Y-%m-%dT00:00:00')
+    end_str        = pd.to_datetime(end_date).strftime('%Y-%m-%dT23:59:59')
+    return _shopify_paginate_orders(store_url, access_token, lookback_start, end_str)
+
+def process_shopify_data(orders_list: list, start_date, end_date):
+    """
+    Convert raw Shopify order list into:
+      - metrics dict (KPIs)
+      - daily_df    (date-level aggregation)
+      - orders_df   (order-level, date-range only)
+    New vs returning: a customer is "new" if their first order in the dataset
+    falls within the selected date range.
+    """
+    if not orders_list:
+        return {}, pd.DataFrame(), pd.DataFrame()
+
+    rows = []
+    for o in orders_list:
+        cid = None
+        if o.get('customer'):
+            cid = o['customer'].get('id')
+        rows.append({
+            'order_id':     o['id'],
+            'created_at':   pd.to_datetime(o['created_at']).tz_localize(None),
+            'total_price':  float(o.get('total_price', 0) or 0),
+            'customer_id':  cid,
+            'line_items':   o.get('line_items', []),
+        })
+
+    df_all = pd.DataFrame(rows)
+    df_all['date'] = df_all['created_at'].dt.normalize()
+
+    # Build first-order-date lookup across ALL fetched history
+    first_ord = (df_all[df_all['customer_id'].notna()]
+                 .groupby('customer_id')['created_at'].min()
+                 .reset_index()
+                 .rename(columns={'created_at': 'first_order_date'}))
+    df_all = df_all.merge(first_ord, on='customer_id', how='left')
+
+    # Filter to selected date range
+    s = pd.to_datetime(start_date)
+    e = pd.to_datetime(end_date) + timedelta(days=1)
+    df = df_all[(df_all['created_at'] >= s) & (df_all['created_at'] < e)].copy()
+
+    if df.empty:
+        return {}, pd.DataFrame(), pd.DataFrame()
+
+    # Classify: new = first_order_date within selected range (or guest / no prior history)
+    df['is_new'] = df.apply(lambda x:
+        True if pd.isna(x.get('customer_id')) or pd.isna(x.get('first_order_date'))
+        else (x['first_order_date'] >= s),
+        axis=1)
+
+    new_df = df[df['is_new']]
+    ret_df = df[~df['is_new']]
+
+    def safe_div(a, b): return a / b if b > 0 else 0
+
+    metrics = {
+        'total_sales':  df['total_price'].sum(),
+        'total_orders': len(df),
+        'total_aov':    safe_div(df['total_price'].sum(), len(df)),
+        'new_sales':    new_df['total_price'].sum(),
+        'new_orders':   len(new_df),
+        'new_aov':      safe_div(new_df['total_price'].sum(), len(new_df)),
+        'ret_sales':    ret_df['total_price'].sum(),
+        'ret_orders':   len(ret_df),
+        'ret_aov':      safe_div(ret_df['total_price'].sum(), len(ret_df)),
+        'ret_rate':     safe_div(len(ret_df), len(df)) * 100,
+        'unique_customers': df['customer_id'].nunique(),
+    }
+
+    # Daily aggregation
+    daily_total = df.groupby('date').agg(
+        total_sales=('total_price','sum'), total_orders=('order_id','count')
+    ).reset_index()
+    daily_new = new_df.groupby('date').agg(
+        new_sales=('total_price','sum'), new_orders=('order_id','count')
+    ).reset_index()
+    daily_ret = ret_df.groupby('date').agg(
+        ret_sales=('total_price','sum'), ret_orders=('order_id','count')
+    ).reset_index()
+
+    daily_df = (daily_total
+                .merge(daily_new, on='date', how='left')
+                .merge(daily_ret, on='date', how='left')
+                .fillna(0))
+
+    return metrics, daily_df, df
+
+def extract_shopify_top_products(orders_df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
+    """Aggregate line items across orders_df into a top-N products table."""
+    if orders_df.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, order in orders_df.iterrows():
+        for item in order.get('line_items', []):
+            qty = int(item.get('quantity', 0) or 0)
+            price = float(item.get('price', 0) or 0)
+            rows.append({
+                'product_title': item.get('title', 'Unknown'),
+                'quantity':      qty,
+                'price':         price,
+                'revenue':       price * qty,
+            })
+    if not rows:
+        return pd.DataFrame()
+    prod_df = pd.DataFrame(rows)
+    agg = (prod_df.groupby('product_title')
+           .agg(orders=('revenue','count'),
+                units_sold=('quantity','sum'),
+                revenue=('revenue','sum'))
+           .reset_index()
+           .sort_values('revenue', ascending=False)
+           .head(top_n))
+    total_rev = agg['revenue'].sum()
+    agg['pct_of_total'] = agg['revenue'] / total_rev * 100 if total_rev > 0 else 0
+    agg['aov'] = agg.apply(lambda x: x['revenue']/x['orders'] if x['orders']>0 else 0, axis=1)
+    return agg.reset_index(drop=True)
+
 # ─────────────────────────────────────────────
 # SHARED CHART HELPERS
 # ─────────────────────────────────────────────
@@ -912,6 +1334,7 @@ def main():
     any_platform = (
         st.session_state.google_connected  or st.session_state.google_csv_uploaded  or
         st.session_state.meta_connected    or st.session_state.meta_csv_uploaded    or
+        st.session_state.bing_connected    or st.session_state.bing_csv_uploaded    or
         st.session_state.tiktok_connected  or st.session_state.tiktok_csv_uploaded  or
         st.session_state.shopify_connected or st.session_state.shopify_csv_uploaded
     )
@@ -919,6 +1342,7 @@ def main():
     tab_list = ["🏠 Welcome & Setup"]
     if any_platform:
         tab_list += [
+            "⚡ Performance Overview",
             "📊 Aggregate Overview",
             "📈 Campaign Breakdown",
             "🛍️ Product Breakdown",
@@ -936,7 +1360,7 @@ def main():
         st.markdown('<p class="main-header">Multi-Platform Marketing Analytics Dashboard</p>', unsafe_allow_html=True)
         st.markdown("""
         ### Welcome! 🎉
-        Connect your marketing platforms to get comprehensive analytics across **Google Ads**, **Meta Ads**, **TikTok**, and **Shopify**.
+        Connect your marketing platforms to get comprehensive analytics across **Google Ads**, **Meta Ads**, **Microsoft Ads**, **TikTok**, and **Shopify**.
         - 🔗 **API Integration** (recommended): Real-time data, automatic updates
         - 📁 **CSV Upload**: Manual data upload, works offline
         """)
@@ -944,7 +1368,7 @@ def main():
 
         # ── Connection status cards ──
         st.markdown("### 📊 Connection Status")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
 
         def _status_card(col, emoji, label, connected, method):
             bg = '#d1fae5' if connected else '#f3f4f6'
@@ -959,6 +1383,7 @@ def main():
 
         google_ok  = st.session_state.google_connected  or st.session_state.google_csv_uploaded
         meta_ok    = st.session_state.meta_connected    or st.session_state.meta_csv_uploaded
+        bing_ok    = st.session_state.bing_connected    or st.session_state.bing_csv_uploaded
         tiktok_ok  = st.session_state.tiktok_connected  or st.session_state.tiktok_csv_uploaded
         shopify_ok = st.session_state.shopify_connected or st.session_state.shopify_csv_uploaded
 
@@ -968,10 +1393,13 @@ def main():
         _status_card(c2, "🔵", "Meta Ads",
                      meta_ok,
                      "API" if st.session_state.meta_connected else ("CSV" if st.session_state.meta_csv_uploaded else "—"))
-        _status_card(c3, "⚫", "TikTok Ads",
+        _status_card(c3, "🔷", "Microsoft Ads",
+                     bing_ok,
+                     "API" if st.session_state.bing_connected else ("CSV" if st.session_state.bing_csv_uploaded else "—"))
+        _status_card(c4, "⚫", "TikTok Ads",
                      tiktok_ok,
                      "API" if st.session_state.tiktok_connected else ("CSV" if st.session_state.tiktok_csv_uploaded else "—"))
-        _status_card(c4, "🟢", "Shopify",
+        _status_card(c5, "🟢", "Shopify",
                      shopify_ok,
                      "API" if st.session_state.shopify_connected else ("CSV" if st.session_state.shopify_csv_uploaded else "—"))
 
@@ -990,7 +1418,7 @@ def main():
         # ── Platform selector ──
         setup_option = st.radio(
             "Choose platform to configure:",
-            ["🔵 Google Ads", "🔵 Meta (Facebook) Ads", "⚫ TikTok Ads", "🟢 Shopify"],
+            ["🔵 Google Ads", "🔵 Meta (Facebook) Ads", "🔷 Microsoft (Bing) Ads", "⚫ TikTok Ads", "🟢 Shopify"],
             horizontal=True
         )
 
@@ -1165,6 +1593,107 @@ def main():
                     except Exception as e:
                         st.error(f"Error reading CSV: {e}")
 
+        # ──────────── MICROSOFT (BING) ADS SETUP ────────────
+        elif "Microsoft" in setup_option:
+            st.markdown("### 🔷 Microsoft (Bing) Ads Setup")
+            bing_method = st.radio("Connection method:", ["API Integration", "CSV Upload"], key="bing_method")
+
+            if bing_method == "API Integration":
+                with st.expander("📚 How to get Microsoft Ads API credentials", expanded=False):
+                    st.markdown("""
+                    | Credential | Where to get it |
+                    |---|---|
+                    | **Developer Token** | [Microsoft Ads UI](https://ads.microsoft.com) → Tools → API Center → Request developer token |
+                    | **Client ID** | [Azure Portal](https://portal.azure.com) → App Registrations → New Registration → copy Application (client) ID |
+                    | **Client Secret** | Same Azure app → Certificates & Secrets → New client secret → copy Value |
+                    | **Customer ID** | Microsoft Ads UI → top-right account switcher (numeric ID) |
+                    | **Account ID** | Microsoft Ads UI → specific account number (different from Customer ID) |
+                    | **Refresh Token** | One-time OAuth flow — see below |
+
+                    **Generating your Refresh Token (one time only):**
+                    ```python
+                    from bingads.authorization import OAuthWebAuthCodeGrant
+                    auth = OAuthWebAuthCodeGrant(client_id, client_secret,
+                        'https://login.microsoftonline.com/common/oauth2/nativeclient')
+                    print(auth.get_authorization_endpoint())   # Open this URL, sign in, copy the code param
+                    tokens = auth.request_oauth_tokens_by_response_uri('PASTE_REDIRECT_URL_HERE')
+                    print(tokens.refresh_token)   # Save this
+                    ```
+                    ⚠️ **Conversion/revenue tracking** requires the UET (Universal Event Tracking) tag
+                    firing `purchase` events on your store's confirmation page.
+                    """)
+
+                with st.form("bing_api_form"):
+                    st.subheader("Microsoft Ads API Credentials")
+                    bing_dev_token  = st.text_input("Developer Token *",  type="password")
+                    col1, col2      = st.columns(2)
+                    bing_client_id     = col1.text_input("Client ID (Azure App) *")
+                    bing_client_secret = col2.text_input("Client Secret *", type="password")
+                    bing_refresh_token = st.text_input("Refresh Token *",  type="password")
+                    col1, col2      = st.columns(2)
+                    bing_customer_id = col1.text_input("Customer ID *",  help="Numeric ID in top-right of Microsoft Ads UI")
+                    bing_account_id  = col2.text_input("Account ID *",   help="Specific ad account numeric ID")
+                    sub_bing = st.form_submit_button("🚀 Connect Microsoft Ads", type="primary")
+
+                    if sub_bing:
+                        if not all([bing_dev_token, bing_client_id, bing_client_secret,
+                                    bing_refresh_token, bing_customer_id, bing_account_id]):
+                            st.error("All fields are required.")
+                        else:
+                            with st.spinner("Validating Microsoft Ads credentials…"):
+                                ok, err, info, auth_data = validate_bing_connection(
+                                    bing_dev_token, bing_client_id, bing_client_secret,
+                                    bing_refresh_token, bing_customer_id, bing_account_id
+                                )
+                            if ok:
+                                st.session_state.bing_developer_token = bing_dev_token
+                                st.session_state.bing_client_id       = bing_client_id
+                                st.session_state.bing_client_secret   = bing_client_secret
+                                st.session_state.bing_refresh_token   = bing_refresh_token
+                                st.session_state.bing_customer_id     = bing_customer_id
+                                st.session_state.bing_account_id      = bing_account_id
+                                st.session_state.bing_account_info    = info
+                                st.session_state.bing_auth_data       = auth_data
+                                st.session_state.bing_connected       = True
+                                st.success(f"✅ Connected to Microsoft Ads — **{info.get('name','—')}** "
+                                           f"(Account {info.get('id','—')}, {info.get('currency','—')})")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Connection failed: {err}")
+                                if "not installed" in (err or ""):
+                                    st.code("pip install bingads", language="bash")
+
+                if st.session_state.bing_connected and st.session_state.bing_account_info:
+                    info = st.session_state.bing_account_info
+                    st.success(f"✅ Microsoft Ads connected — **{info.get('name','—')}** "
+                               f"| Account: {info.get('id','—')} | {info.get('currency','—')}")
+                    if st.button("🔓 Disconnect Microsoft Ads"):
+                        for k in ['bing_connected','bing_developer_token','bing_client_id',
+                                  'bing_client_secret','bing_refresh_token','bing_customer_id',
+                                  'bing_account_id','bing_account_info','bing_auth_data',
+                                  'bing_campaign_data','bing_daily_data']:
+                            st.session_state[k] = False if k == 'bing_connected' else None
+                        st.rerun()
+
+            else:  # CSV
+                st.info("Required columns: `date` (YYYY-MM-DD), `cost`. Optional: `clicks`, `impressions`, `conversions`, `revenue`, `campaign_name`.")
+                f = st.file_uploader("Upload Microsoft Ads CSV", type=['csv'], key="bing_csv_uploader")
+                if f:
+                    try:
+                        df = pd.read_csv(f)
+                        df.columns = [c.lower().strip() for c in df.columns]
+                        if 'date' not in df.columns or 'cost' not in df.columns:
+                            st.error("CSV must contain 'date' and 'cost' columns.")
+                        else:
+                            df['date'] = pd.to_datetime(df['date'])
+                            df['platform'] = 'Microsoft Ads'
+                            st.session_state.bing_data        = df
+                            st.session_state.bing_csv_uploaded = True
+                            st.success(f"✅ Uploaded! ({len(df)} rows)")
+                            st.dataframe(df.head(10))
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
         # ──────────── TIKTOK SETUP ────────────
         elif "TikTok" in setup_option:
             st.markdown("### ⚫ TikTok Ads Setup")
@@ -1198,13 +1727,48 @@ def main():
             st.markdown("### 🟢 Shopify Setup")
             shopify_method = st.radio("Connection method:", ["API Integration", "CSV Upload"], key="shopify_method")
             if shopify_method == "API Integration":
+                with st.expander("📚 How to get Shopify API credentials", expanded=False):
+                    st.markdown("""
+                    1. In your Shopify Admin go to **Settings → Apps and sales channels → Develop apps**
+                    2. Click **Create an app** → give it a name (e.g. "Marketing Dashboard")
+                    3. Click **Configure Admin API scopes** and enable:
+                       - `read_orders`, `read_customers`, `read_products`
+                    4. Click **Install app** → copy the **Admin API access token** (shown once)
+                    5. Your Store URL is `yourstore.myshopify.com`
+                    """)
                 with st.form("shopify_api_form"):
                     st.subheader("Shopify API Credentials")
-                    st.text_input("Store URL", placeholder="mystore.myshopify.com", key="shopify_store_url")
-                    st.text_input("Admin API Access Token", type="password", key="shopify_access_token")
-                    if st.form_submit_button("🚀 Connect Shopify", type="primary"):
-                        st.warning("⚠️ Shopify API coming in Phase 3. Please use CSV upload for now.")
+                    shopify_url_input   = st.text_input("Store URL *", placeholder="mystore.myshopify.com")
+                    shopify_token_input = st.text_input("Admin API Access Token *", type="password")
+                    submitted_shopify   = st.form_submit_button("🚀 Connect Shopify", type="primary")
+                    if submitted_shopify:
+                        if not shopify_url_input or not shopify_token_input:
+                            st.error("Both Store URL and Access Token are required.")
+                        else:
+                            with st.spinner("Validating Shopify credentials…"):
+                                ok, err, info = validate_shopify_connection(shopify_url_input, shopify_token_input)
+                            if ok:
+                                st.session_state.shopify_store_url_val   = shopify_url_input
+                                st.session_state.shopify_access_token_val = shopify_token_input
+                                st.session_state.shopify_shop_info        = info
+                                st.session_state.shopify_connected        = True
+                                st.success(f"✅ Connected to **{info['name']}** ({info['currency']}, {info['plan']})")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {err}")
+
+                if st.session_state.shopify_connected and st.session_state.shopify_shop_info:
+                    info = st.session_state.shopify_shop_info
+                    st.success(f"✅ Shopify connected — **{info['name']}** | {info['domain']} | {info['currency']} | {info['plan']}")
+                    if st.button("🔓 Disconnect Shopify"):
+                        for k in ['shopify_connected','shopify_store_url_val','shopify_access_token_val',
+                                  'shopify_shop_info','shopify_orders_df','shopify_metrics',
+                                  'shopify_daily_df','shopify_top_products']:
+                            st.session_state[k] = None if st.session_state[k] != False else False
+                        st.session_state.shopify_connected = False
+                        st.rerun()
             else:
+                st.info("CSV upload is a fallback — for full new/returning customer data, use API integration.")
                 f = st.file_uploader("Upload Shopify CSV", type=['csv'], key="shopify_csv_uploader")
                 if f:
                     try:
@@ -1237,24 +1801,204 @@ def main():
     if not any_platform:
         return
 
+
     # ══════════════════════════════════════════
-    # TAB 1 — AGGREGATE OVERVIEW
+    # TAB 1 — PERFORMANCE OVERVIEW (Blended)
     # ══════════════════════════════════════════
     with tabs[1]:
+        st.header("⚡ Performance Overview")
+        st.caption("Blended view across all connected platforms. Load campaign data in Campaign Breakdown and Shopify data below first.")
+
+        # ── Collect ad spend data from session state ──
+        g_data  = st.session_state.campaign_data       # Google campaigns
+        m_data  = st.session_state.meta_campaign_data  # Meta campaigns
+        b_data  = st.session_state.bing_campaign_data  # Bing campaigns
+        g_daily = st.session_state.daily_data_camp     # Google daily
+        m_daily = st.session_state.meta_daily_data     # Meta daily
+        b_daily = st.session_state.bing_daily_data     # Bing daily
+
+        shopify_avail = st.session_state.shopify_connected or st.session_state.shopify_csv_uploaded
+        g_avail = st.session_state.google_connected or st.session_state.google_csv_uploaded
+        m_avail = st.session_state.meta_connected   or st.session_state.meta_csv_uploaded
+        bing_avail_pov = st.session_state.bing_connected or st.session_state.bing_csv_uploaded
+
+        # ── Shopify data loader for this tab ──
+        if shopify_avail:
+            col1, col2 = st.columns(2)
+            pov_start = col1.date_input("Start Date", value=datetime.now()-timedelta(days=30), key="pov_start")
+            pov_end   = col2.date_input("End Date",   value=datetime.now(), key="pov_end")
+
+            if st.session_state.shopify_connected:
+                if st.button("📥 Load Shopify Revenue Data", key="pov_load_shopify", type="primary"):
+                    with st.spinner("Fetching Shopify orders…"):
+                        try:
+                            orders_raw = fetch_shopify_orders(
+                                st.session_state.shopify_store_url_val,
+                                st.session_state.shopify_access_token_val,
+                                pov_start, pov_end
+                            )
+                            metrics, daily_df, orders_df = process_shopify_data(orders_raw, pov_start, pov_end)
+                            if metrics:
+                                st.session_state.shopify_metrics    = metrics
+                                st.session_state.shopify_daily_df   = daily_df
+                                st.session_state.shopify_orders_df  = orders_df
+                                st.success(f"✅ Loaded {len(orders_df)} Shopify orders!")
+                            else:
+                                st.warning("No Shopify orders found for this date range.")
+                        except Exception as e:
+                            st.error(f"Shopify error: {e}")
+        else:
+            st.info("Connect Shopify in **Welcome & Setup** to see blended revenue metrics.")
+            pov_start = datetime.now().date() - timedelta(days=30)
+            pov_end   = datetime.now().date()
+
+        st.markdown("---")
+
+        # ── Compute blended totals ──
+        total_g_spend  = g_data['cost'].sum()  if g_data  is not None and not g_data.empty  else 0
+        total_m_spend  = m_data['cost'].sum()  if m_data  is not None and not m_data.empty  else 0
+        total_b_spend  = b_data['cost'].sum()  if b_data  is not None and not b_data.empty  else 0
+        total_ad_spend = total_g_spend + total_m_spend + total_b_spend
+
+        shopify_metrics = st.session_state.shopify_metrics
+        total_revenue   = shopify_metrics['total_sales'] if shopify_metrics else 0
+        blended_mer     = total_revenue / total_ad_spend if total_ad_spend > 0 else 0
+        net_proxy       = total_revenue - total_ad_spend
+
+        # ── KPI tiles row 1 ──
+        st.subheader("📊 Blended Performance")
+        k1,k2,k3,k4 = st.columns(4)
+        k1.markdown(display_metric_card("Total Ad Spend",   total_ad_spend, None, 'currency'), unsafe_allow_html=True)
+        k2.markdown(display_metric_card("Total Revenue",    total_revenue,  None, 'currency'), unsafe_allow_html=True)
+        k3.markdown(display_metric_card("Blended MER",      blended_mer,    None, 'number'),   unsafe_allow_html=True)
+        k4.markdown(display_metric_card("Revenue − Spend",  net_proxy,      None, 'currency'), unsafe_allow_html=True)
+
+        # ── Platform spend breakdown ──
+        st.markdown("---")
+        st.subheader("💰 Ad Spend by Platform")
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.markdown(display_metric_card("Google Ads Spend",    total_g_spend, None, 'currency'), unsafe_allow_html=True)
+        sc2.markdown(display_metric_card("Meta Ads Spend",      total_m_spend, None, 'currency'), unsafe_allow_html=True)
+        sc3.markdown(display_metric_card("Microsoft Ads Spend", total_b_spend, None, 'currency'), unsafe_allow_html=True)
+        sc4.markdown(display_metric_card("TikTok Spend",        0,             None, 'currency'), unsafe_allow_html=True)
+
+        # ── Charts ──
+        st.markdown("---")
+
+        # Donut: spend mix
+        if total_ad_spend > 0:
+            donut_labels = []
+            donut_vals   = []
+            if total_g_spend > 0: donut_labels.append("Google Ads");     donut_vals.append(total_g_spend)
+            if total_m_spend > 0: donut_labels.append("Meta Ads");       donut_vals.append(total_m_spend)
+            if total_b_spend > 0: donut_labels.append("Microsoft Ads");  donut_vals.append(total_b_spend)
+            if donut_labels:
+                col_d, col_ts = st.columns([1, 2])
+                with col_d:
+                    st.markdown("**Spend Mix**")
+                    fig_donut = go.Figure(go.Pie(
+                        labels=donut_labels, values=donut_vals,
+                        hole=0.55,
+                        marker_colors=['#4285f4','#1877f2','#00b4d8','#000000'][:len(donut_labels)],
+                        textinfo='label+percent'
+                    ))
+                    fig_donut.update_layout(
+                        height=300, showlegend=False,
+                        margin=dict(l=10,r=10,t=30,b=10),
+                        paper_bgcolor='white'
+                    )
+                    st.plotly_chart(fig_donut, use_container_width=True)
+
+                with col_ts:
+                    # Daily Spend vs Revenue time-series
+                    st.markdown("**Daily Spend vs Revenue**")
+                    shopify_daily = st.session_state.shopify_daily_df
+
+                    # Build combined daily df
+                    dfs_to_combine = []
+                    if g_daily is not None and not g_daily.empty:
+                        g_agg = g_daily.groupby('date')['cost'].sum().reset_index().rename(columns={'cost':'g_spend'})
+                        dfs_to_combine.append(('g_spend', g_agg))
+                    if m_daily is not None and not m_daily.empty:
+                        m_agg = m_daily.groupby('date')['cost'].sum().reset_index().rename(columns={'cost':'m_spend'})
+                        dfs_to_combine.append(('m_spend', m_agg))
+                    if b_daily is not None and not b_daily.empty:
+                        b_agg = b_daily.groupby('date')['cost'].sum().reset_index().rename(columns={'cost':'b_spend'})
+                        dfs_to_combine.append(('b_spend', b_agg))
+
+                    if dfs_to_combine or (shopify_daily is not None and not shopify_daily.empty):
+                        from functools import reduce
+                        date_range_idx = pd.date_range(
+                            start=pov_start, end=pov_end, freq='D'
+                        ).to_frame(index=False, name='date')
+                        combined = date_range_idx
+
+                        for col_name, sub_df in dfs_to_combine:
+                            combined = combined.merge(sub_df, on='date', how='left')
+
+                        if shopify_daily is not None and not shopify_daily.empty:
+                            combined = combined.merge(
+                                shopify_daily[['date','total_sales']].rename(columns={'total_sales':'revenue'}),
+                                on='date', how='left'
+                            )
+                        combined = combined.fillna(0)
+
+                        # Total spend column
+                        spend_cols = [c for c in ['g_spend','m_spend','b_spend'] if c in combined.columns]
+                        combined['total_spend'] = combined[spend_cols].sum(axis=1) if spend_cols else 0
+
+                        fig_ts = go.Figure()
+                        fig_ts.add_trace(go.Scatter(
+                            x=combined['date'], y=combined['total_spend'],
+                            name='Total Ad Spend', mode='lines+markers',
+                            line=dict(color='#e53935', width=2),
+                            marker=dict(size=5)
+                        ))
+                        if 'revenue' in combined.columns:
+                            fig_ts.add_trace(go.Scatter(
+                                x=combined['date'], y=combined['revenue'],
+                                name='Shopify Revenue', mode='lines+markers',
+                                line=dict(color='#43a047', width=2),
+                                marker=dict(size=5),
+                                yaxis='y2'
+                            ))
+                        fig_ts.update_layout(
+                            height=280, plot_bgcolor='white', paper_bgcolor='white',
+                            hovermode='x unified',
+                            yaxis=dict(title='Spend ($)', showgrid=True, gridcolor='rgba(200,200,200,0.3)'),
+                            yaxis2=dict(title='Revenue ($)', overlaying='y', side='right', showgrid=False),
+                            legend=dict(orientation="h", y=-0.25, x=0.5, xanchor='center'),
+                            margin=dict(l=50,r=50,t=10,b=60)
+                        )
+                        st.plotly_chart(fig_ts, use_container_width=True)
+                    else:
+                        st.info("Load Campaign Breakdown data and Shopify data to see the time-series chart.")
+        else:
+            st.info("No ad spend data loaded yet. Go to **Campaign Breakdown** and load Google/Meta data first, then come back here.")
+
+        if not shopify_metrics:
+            st.info("No Shopify revenue loaded. Connect Shopify and click **Load Shopify Revenue Data** above.")
+
+    # ══════════════════════════════════════════
+    # TAB 2 — AGGREGATE OVERVIEW
+    # ══════════════════════════════════════════
+    with tabs[2]:
         st.header("📊 Aggregate Overview")
 
         google_avail = st.session_state.google_connected or st.session_state.google_csv_uploaded
         meta_avail   = st.session_state.meta_connected   or st.session_state.meta_csv_uploaded
 
-        if not google_avail and not meta_avail:
-            st.warning("Connect Google Ads or Meta Ads to view aggregate data.")
+        if not google_avail and not meta_avail and not bing_avail_agg:
+            st.warning("Connect Google Ads, Meta Ads, or Microsoft Ads to view aggregate data.")
             st.stop()
 
         # Platform selector
+        bing_avail_agg = st.session_state.bing_connected or st.session_state.bing_csv_uploaded
         platform_options = []
-        if google_avail: platform_options.append("Google Ads")
-        if meta_avail:   platform_options.append("Meta Ads")
-        if google_avail and meta_avail: platform_options.append("All Platforms")
+        if google_avail:  platform_options.append("Google Ads")
+        if meta_avail:    platform_options.append("Meta Ads")
+        if bing_avail_agg: platform_options.append("Microsoft Ads")
+        if len(platform_options) > 1: platform_options.append("All Platforms")
 
         selected_platform_agg = st.radio("Select platform:", platform_options, horizontal=True, key="agg_platform")
 
@@ -1286,6 +2030,14 @@ def main():
                                  'Impressions': m_data['impressions'].sum(),
                                  'Conversions': m_data['conversions'].sum(),
                                  'Revenue': m_data['conversions_value'].sum()})
+                b_data_agg = st.session_state.bing_campaign_data
+                if b_data_agg is not None and not b_data_agg.empty:
+                    rows.append({'Platform':'Microsoft Ads',
+                                 'Spend': b_data_agg['cost'].sum(),
+                                 'Clicks': b_data_agg['clicks'].sum() if 'clicks' in b_data_agg.columns else 0,
+                                 'Impressions': b_data_agg['impressions'].sum() if 'impressions' in b_data_agg.columns else 0,
+                                 'Conversions': b_data_agg['conversions'].sum() if 'conversions' in b_data_agg.columns else 0,
+                                 'Revenue': b_data_agg['conversions_value'].sum() if 'conversions_value' in b_data_agg.columns else 0})
 
                 if rows:
                     summary_df = pd.DataFrame(rows)
@@ -1306,7 +2058,7 @@ def main():
 
                     # Bar chart
                     metric_to_plot = st.selectbox("Metric to compare:", ['Spend','Revenue','Conversions','Clicks','ROAS','CTR %'], key="xplat_metric")
-                    colors_map = {'Google Ads':'#4285f4', 'Meta Ads':'#1877f2'}
+                    colors_map = {'Google Ads':'#4285f4', 'Meta Ads':'#1877f2', 'Microsoft Ads':'#00b4d8'}
                     fig = go.Figure(go.Bar(
                         x=summary_df['Platform'],
                         y=summary_df[metric_to_plot],
@@ -1529,22 +2281,119 @@ def main():
                 else:
                     st.info("👆 Click **Load Daily Chart Data** above to render the time-series chart.")
 
+        # ── Microsoft Ads Aggregate ──
+        elif selected_platform_agg == "Microsoft Ads":
+            if not bing_avail_agg:
+                st.warning("Connect Microsoft Ads first.")
+                st.stop()
+
+            col1, col2 = st.columns(2)
+            start_date_b = col1.date_input("Start Date", value=datetime.now()-timedelta(days=30), key="agg_bing_start")
+            end_date_b   = col2.date_input("End Date",   value=datetime.now(),                    key="agg_bing_end")
+
+            st.markdown("---")
+            c1, c2 = st.columns([4,1])
+            bing_camp_filter_agg = c1.text_input("Filter by Campaign Name", placeholder="Type campaign name…", key="agg_bing_camp_filter")
+            bing_exact_agg       = c2.checkbox("Exact", key="agg_bing_exact")
+
+            if st.button("📥 Load Microsoft Ads KPI Metrics", key="load_agg_bing_kpi", type="primary"):
+                if st.session_state.bing_connected:
+                    with st.spinner("Submitting Microsoft Ads report…"):
+                        b_camp = fetch_bing_campaign_performance(
+                            st.session_state.bing_auth_data,
+                            st.session_state.bing_account_id,
+                            start_date_b, end_date_b
+                        )
+                        if not b_camp.empty:
+                            st.session_state.bing_campaign_data = b_camp
+                            st.success(f"✅ Loaded {len(b_camp)} Microsoft Ads campaigns!")
+                        else:
+                            st.warning("No Microsoft Ads data found for this date range.")
+                elif st.session_state.bing_csv_uploaded and st.session_state.bing_data is not None:
+                    st.session_state.bing_campaign_data = st.session_state.bing_data
+                    st.success("✅ Using uploaded Microsoft Ads CSV.")
+                else:
+                    st.warning("Please connect Microsoft Ads first.")
+
+            if st.session_state.bing_campaign_data is not None and not st.session_state.bing_campaign_data.empty:
+                b_df = st.session_state.bing_campaign_data.copy()
+                if bing_camp_filter_agg:
+                    b_df = b_df[b_df['campaign_name']==bing_camp_filter_agg] if bing_exact_agg else b_df[b_df['campaign_name'].str.contains(bing_camp_filter_agg, case=False, na=False)]
+                if b_df.empty:
+                    st.warning("No matching campaigns.")
+                    st.stop()
+
+                b_spend  = b_df['cost'].sum()
+                b_rev    = b_df['conversions_value'].sum()
+                b_roas   = b_rev/b_spend if b_spend>0 else 0
+                b_clicks = b_df['clicks'].sum() if 'clicks' in b_df.columns else 0
+                b_impr   = b_df['impressions'].sum() if 'impressions' in b_df.columns else 0
+                b_conv   = b_df['conversions'].sum() if 'conversions' in b_df.columns else 0
+                b_cpc    = b_spend/b_clicks if b_clicks>0 else 0
+                b_ctr    = b_clicks/b_impr*100 if b_impr>0 else 0
+
+                st.subheader("Key Performance Metrics — Microsoft Ads")
+                c1,c2,c3 = st.columns(3)
+                c1.markdown(display_metric_card("Spend",       b_spend,  None, 'currency'),   unsafe_allow_html=True)
+                c2.markdown(display_metric_card("CPC",         b_cpc,    None, 'currency'),   unsafe_allow_html=True)
+                c3.markdown(display_metric_card("ROAS",        b_roas,   None, 'number'),     unsafe_allow_html=True)
+                c1,c2,c3 = st.columns(3)
+                c1.markdown(display_metric_card("CTR",         b_ctr,    None, 'percentage'), unsafe_allow_html=True)
+                c2.markdown(display_metric_card("Clicks",      b_clicks, None, 'number'),     unsafe_allow_html=True)
+                c3.markdown(display_metric_card("Impressions", b_impr,   None, 'number'),     unsafe_allow_html=True)
+                c1,c2,c3 = st.columns(3)
+                c1.markdown(display_metric_card("Revenue",     b_rev,    None, 'currency'),   unsafe_allow_html=True)
+                c2.markdown(display_metric_card("Conversions", b_conv,   None, 'number'),     unsafe_allow_html=True)
+
+                # Daily time-series
+                st.markdown("---")
+                st.subheader("📈 Microsoft Ads Performance Over Time")
+                st.caption("Daily data fetched separately via report request.")
+                if st.button("📥 Load Daily Chart Data", key="load_agg_bing_daily"):
+                    if st.session_state.bing_connected:
+                        with st.spinner("Fetching daily Microsoft Ads data…"):
+                            b_daily = fetch_bing_daily_performance(
+                                st.session_state.bing_auth_data,
+                                st.session_state.bing_account_id,
+                                start_date_b, end_date_b
+                            )
+                            if not b_daily.empty:
+                                st.session_state.bing_daily_data = b_daily
+                                st.success(f"✅ Daily data loaded! ({len(b_daily)} rows)")
+                            else:
+                                st.warning("No daily data returned.")
+
+                if st.session_state.bing_daily_data is not None and not st.session_state.bing_daily_data.empty:
+                    daily_b = st.session_state.bing_daily_data.copy()
+                    if bing_camp_filter_agg:
+                        daily_b = daily_b[daily_b['campaign_name']==bing_camp_filter_agg] if bing_exact_agg else daily_b[daily_b['campaign_name'].str.contains(bing_camp_filter_agg, case=False, na=False)]
+                    metric_opts_b = {'cost':'Spend','clicks':'Clicks','impressions':'Impressions',
+                                     'conversions':'Conversions','conversions_value':'Revenue',
+                                     'ctr':'CTR (%)','cpc':'CPC','conv_value_cost':'ROAS','aov':'AOV'}
+                    sel_b_agg = st.selectbox("Metric:", list(metric_opts_b.keys()),
+                                             format_func=lambda x: metric_opts_b[x], key="agg_bing_metric")
+                    st.plotly_chart(create_time_series_chart(daily_b, sel_b_agg, metric_opts_b[sel_b_agg]), use_container_width=True)
+                else:
+                    st.info("👆 Click **Load Daily Chart Data** above to render the time-series chart.")
+
     # ══════════════════════════════════════════
-    # TAB 2 — CAMPAIGN BREAKDOWN
+    # TAB 3 — CAMPAIGN BREAKDOWN
     # ══════════════════════════════════════════
-    with tabs[2]:
+    with tabs[3]:
         st.header("📈 Campaign Breakdown")
 
         google_avail = st.session_state.google_connected or st.session_state.google_csv_uploaded
         meta_avail   = st.session_state.meta_connected   or st.session_state.meta_csv_uploaded
 
-        if not google_avail and not meta_avail:
-            st.warning("Connect Google Ads or Meta Ads to view campaign data.")
+        if not google_avail and not meta_avail and not bing_avail_camp:
+            st.warning("Connect Google Ads, Meta Ads, or Microsoft Ads to view campaign data.")
             st.stop()
 
+        bing_avail_camp = st.session_state.bing_connected or st.session_state.bing_csv_uploaded
         plat_options_camp = []
-        if google_avail: plat_options_camp.append("Google Ads")
-        if meta_avail:   plat_options_camp.append("Meta Ads")
+        if google_avail:     plat_options_camp.append("Google Ads")
+        if meta_avail:       plat_options_camp.append("Meta Ads")
+        if bing_avail_camp:  plat_options_camp.append("Microsoft Ads")
 
         selected_platform_camp = st.radio("Platform:", plat_options_camp, horizontal=True, key="camp_platform")
 
@@ -1825,10 +2674,110 @@ def main():
                 st.download_button("📥 Download Meta Campaign CSV", csv_m,
                                    f"meta_campaigns_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
 
+        # ── MICROSOFT ADS CAMPAIGNS ──
+        elif selected_platform_camp == "Microsoft Ads":
+            if not bing_avail_camp:
+                st.warning("Connect Microsoft Ads first.")
+                st.stop()
+
+            col1, col2 = st.columns(2)
+            start_date_bing = col1.date_input("Start Date", value=datetime.now()-timedelta(days=30), key="bing_camp_start")
+            end_date_bing   = col2.date_input("End Date",   value=datetime.now(),                    key="bing_camp_end")
+
+            st.markdown("---")
+            c1, c2 = st.columns([4,1])
+            camp_filter_b = c1.text_input("Filter by Campaign Name", placeholder="Type campaign name…", key="bing_camp_filter")
+            exact_b       = c2.checkbox("Exact", key="bing_camp_exact")
+
+            if st.button("📥 Load Microsoft Campaign Data", key="load_bing_camp", type="primary"):
+                if st.session_state.bing_connected:
+                    with st.spinner("Submitting report to Microsoft Ads… (may take 30-60s)"):
+                        b_camp = fetch_bing_campaign_performance(
+                            st.session_state.bing_auth_data,
+                            st.session_state.bing_account_id,
+                            start_date_bing, end_date_bing
+                        )
+                        if not b_camp.empty:
+                            st.session_state.bing_campaign_data = b_camp
+                            st.success(f"✅ Loaded {len(b_camp)} Microsoft Ads campaigns! Click 'Load Daily Data' for time-series.")
+                        else:
+                            st.warning("No data found. Check campaigns have spend in this date range.")
+                elif st.session_state.bing_csv_uploaded and st.session_state.bing_data is not None:
+                    st.session_state.bing_campaign_data = st.session_state.bing_data
+                    st.success("✅ Using uploaded Microsoft Ads CSV.")
+                else:
+                    st.warning("Please connect Microsoft Ads first.")
+
+            if st.session_state.bing_campaign_data is not None and not st.session_state.bing_campaign_data.empty:
+                st.markdown("---")
+                df_b = st.session_state.bing_campaign_data.copy()
+                if camp_filter_b:
+                    df_b = df_b[df_b['campaign_name']==camp_filter_b] if exact_b else df_b[df_b['campaign_name'].str.contains(camp_filter_b, case=False, na=False)]
+                if df_b.empty:
+                    st.warning(f"No campaigns matching '{camp_filter_b}'")
+                    st.stop()
+
+                st.subheader("🏆 Campaign Performance Insights — Microsoft Ads")
+                render_hero_kpi_cards(df_b, "Microsoft Ads")
+
+                st.markdown("### 📊 Top 5 Microsoft Ads Campaigns")
+                render_top5_bar_chart(df_b, 'campaign_name',
+                                      ['conversions_value','cost'],
+                                      {'cost':'Spend','conversions':'Conversions','conversions_value':'Revenue',
+                                       'conv_value_cost':'ROAS','clicks':'Clicks','cpc':'CPC'},
+                                      key_suffix="bing_camp")
+
+                st.markdown("---")
+                render_campaign_table(df_b, platform='Meta')  # Meta layout = no budget col, works for Bing too
+
+                # Daily time-series
+                st.markdown("---")
+                st.subheader("📈 Microsoft Ads Performance Over Time")
+                st.caption("Daily data is fetched via a separate report request.")
+
+                if st.button("📥 Load Daily Chart Data", key="load_bing_daily"):
+                    if st.session_state.bing_connected:
+                        with st.spinner("Fetching daily Microsoft Ads data…"):
+                            b_daily = fetch_bing_daily_performance(
+                                st.session_state.bing_auth_data,
+                                st.session_state.bing_account_id,
+                                start_date_bing, end_date_bing
+                            )
+                            if not b_daily.empty:
+                                st.session_state.bing_daily_data = b_daily
+                                st.success(f"✅ Daily data loaded! ({len(b_daily)} rows)")
+                            else:
+                                st.warning("No daily data returned.")
+                    else:
+                        st.warning("Daily chart requires API connection.")
+
+                if st.session_state.bing_daily_data is not None and not st.session_state.bing_daily_data.empty:
+                    daily_b = st.session_state.bing_daily_data.copy()
+                    if camp_filter_b:
+                        daily_b = daily_b[daily_b['campaign_name']==camp_filter_b] if exact_b else daily_b[daily_b['campaign_name'].str.contains(camp_filter_b, case=False, na=False)]
+                    if not daily_b.empty:
+                        metric_opts_b = {'cost':'Spend','clicks':'Clicks','impressions':'Impressions',
+                                         'conversions':'Conversions','conversions_value':'Revenue',
+                                         'ctr':'CTR (%)','cpc':'CPC','conv_value_cost':'ROAS',
+                                         'cost_per_conv':'Cost/Conv','aov':'AOV'}
+                        sel_b = st.multiselect("Select up to 3 metrics:", list(metric_opts_b.keys()),
+                                               default=['cost','conversions_value'], max_selections=3,
+                                               format_func=lambda x: metric_opts_b[x], key="bing_camp_metrics")
+                        if sel_b:
+                            fig_b = create_multi_metric_chart(daily_b, None, sel_b, metric_opts_b, False)
+                            st.plotly_chart(fig_b, use_container_width=True)
+                else:
+                    st.info("👆 Click **Load Daily Chart Data** above to render the time-series chart.")
+
+                # Download
+                csv_b = df_b.to_csv(index=False)
+                st.download_button("📥 Download Microsoft Ads CSV", csv_b,
+                                   f"bing_campaigns_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
+
     # ══════════════════════════════════════════
-    # TAB 3 — PRODUCT BREAKDOWN (Google only)
+    # TAB 4 — PRODUCT BREAKDOWN (Google only)
     # ══════════════════════════════════════════
-    with tabs[3]:
+    with tabs[4]:
         st.header("🛍️ Product Breakdown")
         if not (st.session_state.google_connected or st.session_state.google_csv_uploaded):
             st.warning("⚠️ Connect Google Ads to view product data.")
@@ -1909,9 +2858,9 @@ def main():
                                f"products_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
 
     # ══════════════════════════════════════════
-    # TAB 4 — CHANGE HISTORY (Google only)
+    # TAB 5 — CHANGE HISTORY (Google only)
     # ══════════════════════════════════════════
-    with tabs[4]:
+    with tabs[5]:
         st.header("📜 Change History")
         if not (st.session_state.google_connected or st.session_state.google_csv_uploaded):
             st.warning("⚠️ Connect Google Ads to view change history.")
@@ -1959,29 +2908,210 @@ def main():
                 st.info("No changes match the selected filters.")
 
     # ══════════════════════════════════════════
-    # TAB 5 — SHOPIFY ANALYTICS (placeholder)
-    # ══════════════════════════════════════════
-    with tabs[5]:
-        st.header("🟢 Shopify Analytics")
-        if not (st.session_state.shopify_connected or st.session_state.shopify_csv_uploaded):
-            st.warning("⚠️ Connect Shopify to view analytics.")
-            st.info("Go to **Welcome & Setup → Shopify** to upload your CSV or connect via API.")
-        else:
-            st.success("✅ Shopify data connected.")
-            st.info("📊 **Full Shopify analytics coming in Phase 3!**")
-            st.markdown("""
-            **Planned features:**
-            - Total orders, revenue & AOV metrics
-            - New vs returning customer split
-            - Retention curves and cohort analysis
-            - Revenue time-series with trend detection
-            - Customer lifetime value (CLV) estimates
-            """)
-
-    # ══════════════════════════════════════════
-    # TAB 6 — MMM (placeholder)
+    # TAB 6 — SHOPIFY ANALYTICS
     # ══════════════════════════════════════════
     with tabs[6]:
+        st.header("🟢 Shopify Analytics")
+
+        shopify_api_avail = st.session_state.shopify_connected
+        shopify_csv_avail = st.session_state.shopify_csv_uploaded
+
+        if not shopify_api_avail and not shopify_csv_avail:
+            st.warning("⚠️ Connect Shopify to view analytics.")
+            st.info("Go to **Welcome & Setup → 🟢 Shopify** to connect via API or upload a CSV.")
+        else:
+            # Show connected store info
+            if shopify_api_avail and st.session_state.shopify_shop_info:
+                info = st.session_state.shopify_shop_info
+                st.success(f"✅ Connected: **{info['name']}** ({info['currency']}, {info['plan']})")
+
+            # ── Date range ──
+            col1, col2 = st.columns(2)
+            sh_start = col1.date_input("Start Date", value=datetime.now()-timedelta(days=30), key="sh_start")
+            sh_end   = col2.date_input("End Date",   value=datetime.now(), key="sh_end")
+
+            if shopify_api_avail:
+                if st.button("📥 Load Shopify Data", key="load_shopify_tab", type="primary"):
+                    with st.spinner("Fetching Shopify orders (includes 1-year lookback for new/returning classification)…"):
+                        try:
+                            orders_raw = fetch_shopify_orders(
+                                st.session_state.shopify_store_url_val,
+                                st.session_state.shopify_access_token_val,
+                                sh_start, sh_end
+                            )
+                            metrics, daily_df, orders_df = process_shopify_data(orders_raw, sh_start, sh_end)
+                            if metrics:
+                                st.session_state.shopify_metrics      = metrics
+                                st.session_state.shopify_daily_df     = daily_df
+                                st.session_state.shopify_orders_df    = orders_df
+                                top_prods = extract_shopify_top_products(orders_df, top_n=10)
+                                st.session_state.shopify_top_products = top_prods
+                                st.success(f"✅ Loaded {len(orders_df)} orders!")
+                            else:
+                                st.warning("No orders found for this date range.")
+                        except Exception as e:
+                            st.error(f"Shopify error: {e}")
+            elif shopify_csv_avail:
+                st.info("CSV mode: showing data from uploaded file. New/returning classification not available without API.")
+
+            metrics  = st.session_state.shopify_metrics
+            daily_df = st.session_state.shopify_daily_df
+            top_prods= st.session_state.shopify_top_products
+
+            if metrics:
+                st.markdown("---")
+
+                # ── KPI ROW 1: Overall ──
+                st.subheader("📊 Overall Performance")
+                k1, k2, k3 = st.columns(3)
+                k1.markdown(display_metric_card("Total Sales",   metrics['total_sales'],  None, 'currency'), unsafe_allow_html=True)
+                k2.markdown(display_metric_card("Total Orders",  metrics['total_orders'], None, 'number'),   unsafe_allow_html=True)
+                k3.markdown(display_metric_card("Overall AOV",   metrics['total_aov'],    None, 'currency'), unsafe_allow_html=True)
+
+                st.markdown("---")
+
+                # ── KPI ROW 2 & 3: New vs Returning ──
+                st.subheader("👥 New vs Returning Customers")
+                nc1, nc2, nc3, rc1, rc2, rc3 = st.columns(6)
+                nc1.markdown(display_metric_card("New Cust. Sales",   metrics['new_sales'],   None, 'currency'), unsafe_allow_html=True)
+                nc2.markdown(display_metric_card("New Cust. Orders",  metrics['new_orders'],  None, 'number'),   unsafe_allow_html=True)
+                nc3.markdown(display_metric_card("New Cust. AOV",     metrics['new_aov'],     None, 'currency'), unsafe_allow_html=True)
+                rc1.markdown(display_metric_card("Return. Sales",     metrics['ret_sales'],   None, 'currency'), unsafe_allow_html=True)
+                rc2.markdown(display_metric_card("Return. Orders",    metrics['ret_orders'],  None, 'number'),   unsafe_allow_html=True)
+                rc3.markdown(display_metric_card("Return. AOV",       metrics['ret_aov'],     None, 'currency'), unsafe_allow_html=True)
+
+                st.markdown("---")
+
+                # ── KPI ROW 4: Rates ──
+                st.subheader("📈 Customer Behaviour")
+                b1, b2, b3, b4 = st.columns(4)
+                b1.markdown(display_metric_card("Returning Cust. Rate", metrics['ret_rate'],         None, 'percentage'), unsafe_allow_html=True)
+                b2.markdown(display_metric_card("Unique Customers",     metrics['unique_customers'], None, 'number'),     unsafe_allow_html=True)
+                b3.markdown(f"""<div class="metric-card">
+                    <div class="metric-label">Sessions</div>
+                    <div class="metric-value" style="font-size:1.3rem;color:#9ca3af;">N/A</div>
+                    <div style="font-size:11px;color:#9ca3af;">Requires GraphQL Analytics API</div>
+                </div>""", unsafe_allow_html=True)
+                b4.markdown(f"""<div class="metric-card">
+                    <div class="metric-label">Conv. Rate</div>
+                    <div class="metric-value" style="font-size:1.3rem;color:#9ca3af;">N/A</div>
+                    <div style="font-size:11px;color:#9ca3af;">Requires sessions data</div>
+                </div>""", unsafe_allow_html=True)
+
+                st.markdown("---")
+
+                # ── Revenue Time-Series ──
+                if daily_df is not None and not daily_df.empty:
+                    st.subheader("📈 Revenue Over Time")
+                    rev_view = st.radio("Show:", ["Total", "New vs Returning", "Orders"], horizontal=True, key="sh_rev_view")
+
+                    fig_sh = go.Figure()
+                    if rev_view == "Total":
+                        fig_sh.add_trace(go.Scatter(
+                            x=daily_df['date'], y=daily_df['total_sales'],
+                            name='Total Revenue', mode='lines+markers',
+                            line=dict(color='#43a047', width=3), fill='tozeroy',
+                            fillcolor='rgba(67,160,71,0.1)'
+                        ))
+                    elif rev_view == "New vs Returning":
+                        fig_sh.add_trace(go.Scatter(
+                            x=daily_df['date'], y=daily_df['new_sales'],
+                            name='New Customer Revenue', mode='lines+markers',
+                            line=dict(color='#1e88e5', width=2)
+                        ))
+                        fig_sh.add_trace(go.Scatter(
+                            x=daily_df['date'], y=daily_df['ret_sales'],
+                            name='Returning Customer Revenue', mode='lines+markers',
+                            line=dict(color='#e53935', width=2)
+                        ))
+                    elif rev_view == "Orders":
+                        fig_sh.add_trace(go.Bar(
+                            x=daily_df['date'], y=daily_df['total_orders'],
+                            name='Total Orders', marker_color='#1e88e5'
+                        ))
+                        fig_sh.add_trace(go.Bar(
+                            x=daily_df['date'], y=daily_df['new_orders'],
+                            name='New Customer Orders', marker_color='#43a047'
+                        ))
+                        fig_sh.add_trace(go.Bar(
+                            x=daily_df['date'], y=daily_df['ret_orders'],
+                            name='Returning Customer Orders', marker_color='#e53935'
+                        ))
+
+                    fig_sh.update_layout(
+                        height=400, plot_bgcolor='white', paper_bgcolor='white',
+                        hovermode='x unified',
+                        legend=dict(orientation="h",y=-0.2,x=0.5,xanchor='center'),
+                        margin=dict(l=50,r=50,t=40,b=80)
+                    )
+                    st.plotly_chart(fig_sh, use_container_width=True)
+
+                st.markdown("---")
+
+                # ── Top 10 Products Table ──
+                st.subheader("🛒 Top 10 Products by Revenue")
+                if top_prods is not None and not top_prods.empty:
+                    top_display = top_prods.copy()
+                    top_display.index = top_display.index + 1  # 1-based rank
+                    top_display.index.name = 'Rank'
+                    top_display = top_display.rename(columns={
+                        'product_title': 'Product',
+                        'orders':        'Orders',
+                        'units_sold':    'Units Sold',
+                        'revenue':       'Revenue ($)',
+                        'pct_of_total':  '% of Total',
+                        'aov':           'AOV ($)',
+                    })
+                    def _style_top(val):
+                        return 'font-weight:bold' if isinstance(val, str) else ''
+                    styled_top = (top_display.style
+                        .format({'Revenue ($)':'{:,.2f}','% of Total':'{:.1f}%','AOV ($)':'{:.2f}'})
+                        .set_table_styles([
+                            {'selector':'thead th','props':[('background-color','#1f2937'),('color','white'),
+                              ('font-weight','bold'),('font-size','14px'),('padding','10px')]},
+                            {'selector':'tbody tr:hover','props':[('background-color','#f3f4f6')]},
+                            {'selector':'tbody td','props':[('padding','9px'),('border','1px solid #e5e7eb')]},
+                        ])
+                        .background_gradient(subset=['Revenue ($)'], cmap='Greens')
+                    )
+                    st.dataframe(styled_top, use_container_width=True)
+
+                    # Download
+                    st.download_button("📥 Download Top Products CSV",
+                                       top_prods.to_csv(index=False),
+                                       f"top_products_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
+                else:
+                    st.info("Top products will appear here after loading data.")
+
+            elif shopify_csv_avail and st.session_state.shopify_data is not None:
+                # CSV fallback — basic view
+                st.markdown("---")
+                csv_df = st.session_state.shopify_data.copy()
+                st.subheader("📊 Shopify CSV Data Overview")
+                total_rev_csv = csv_df['revenue'].sum() if 'revenue' in csv_df.columns else 0
+                total_ord_csv = csv_df['orders'].sum()  if 'orders'  in csv_df.columns else 0
+                aov_csv       = total_rev_csv / total_ord_csv if total_ord_csv > 0 else 0
+                c1,c2,c3 = st.columns(3)
+                c1.markdown(display_metric_card("Total Revenue", total_rev_csv, None, 'currency'), unsafe_allow_html=True)
+                c2.markdown(display_metric_card("Total Orders",  total_ord_csv, None, 'number'),   unsafe_allow_html=True)
+                c3.markdown(display_metric_card("AOV",           aov_csv,       None, 'currency'), unsafe_allow_html=True)
+                if 'revenue' in csv_df.columns:
+                    fig_csv = go.Figure(go.Scatter(
+                        x=csv_df['date'], y=csv_df['revenue'],
+                        mode='lines', fill='tozeroy',
+                        line=dict(color='#43a047', width=2),
+                        fillcolor='rgba(67,160,71,0.1)'
+                    ))
+                    fig_csv.update_layout(height=350, plot_bgcolor='white', paper_bgcolor='white',
+                                          title="Revenue Over Time")
+                    st.plotly_chart(fig_csv, use_container_width=True)
+            else:
+                st.info("👆 Click **Load Shopify Data** above to view analytics.")
+
+    # ══════════════════════════════════════════
+    # TAB 7 — MMM (placeholder)
+    # ══════════════════════════════════════════
+    with tabs[7]:
         st.header("🎯 Marketing Mix Modeling (MMM)")
         st.info("📊 **Full MMM coming in Phase 3-5!**")
         st.markdown("""
@@ -1992,6 +3122,7 @@ def main():
             st.markdown("**Advertising Platforms:**")
             for flag, label in [('google_connected','Google Ads (API)'), ('google_csv_uploaded','Google Ads (CSV)'),
                                   ('meta_connected','Meta Ads (API)'),   ('meta_csv_uploaded','Meta Ads (CSV)'),
+                                  ('bing_connected','Microsoft Ads (API)'), ('bing_csv_uploaded','Microsoft Ads (CSV)'),
                                   ('tiktok_csv_uploaded','TikTok (CSV)')]:
                 if st.session_state[flag]:
                     st.markdown(f"- ✅ {label}")
